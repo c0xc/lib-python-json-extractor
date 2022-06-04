@@ -1,10 +1,13 @@
 """JReader is a JSON parser for huge data structures and limited memory."""
 
+"""2022 - JReader, by Philip Seeger (c0xc)"""
+
 import gzip
 import tempfile
 import functools
 import re
-from multiprocessing import Process, Pipe
+import os
+from multiprocessing import Process, Pipe # TODO use Queue !
 from logging import debug, info, warning, error
 
 from jsonstreamer import JSONStreamer
@@ -30,28 +33,39 @@ class JReader():
         self._bs = 1024*1024
         assert isinstance(self._bs, int), "blocksize must be numeric"
         assert self._bs > 0, "invalid blocksize"
+        self._opt = kwargs.copy()
 
-        # Open input stream, copy it to compressed, temporary file (copy mode)
-        # TODO file handle + rewind func?
-        # TODO alternative: filename (random access fh)
-        if ifile:
-            # Input is a file, keep file handle
-            self._mode = "file"
-            self._copy_mode = True
-            # TODO isinstance str / file; "tfile" ...
-            #    file_handle = open(in_file, "rb")
-            #    if in_file.endswith(".gz"):
-            #        file_handle = gzip.open(file_handle, "rb")
-            self._ifile = ifile
-            # Read, copy file into compressed temp file
-            self._copy_file()
-
-        else:
+        # Get file handle (stdin) or open file path
+        # If requested, copy it to compressed, temporary file (copy mode)
+        self._copy_mode = False
+        self._temp_file = None
+        if not ifile:
             raise Exception("no input data")
+        if isinstance(ifile, str) or isinstance(ifile, os.PathLike):
+            # Input is a file path
+            ifile = open(os.fspath(ifile), "rb")
+        # Input is a file handle
+        self._ifile = ifile
+        self._read_i = 0
 
-    def _copy_file(self):
+        # Initialize copy mode, if requested
+        print("JREADER initialized with fh %s" % (ifile))
+        if kwargs.get("copy_mode") or kwargs.get("auto") and not self.is_seekable():
+            # Read, copy file into compressed temp file
+            print("JREADER copy mode on, copying...")
+            self._copy_file(ifile)
+
+    def is_seekable(self):
+        """Returns true if the input file handle can be rewinded (random access)."""
+
+        return self._copy_mode or self._ifile.seekable()
+
+    def _copy_file(self, ifile):
         # Read and copy stdin into a temporary file for random access mode
-        ifile = self._ifile # stdin
+        # Consume input file and write it to gzipped temporary file
+        self._copy_mode = True
+        if ifile is None:
+            ifile = self._ifile # stdin
         # Consume input file and write it to gzipped temporary file
         # file mode: "wb" and .encode() or explicit "wt"...
         tfile = self._temp_file = tempfile.TemporaryFile(buffering=0)
@@ -59,17 +73,45 @@ class JReader():
             for b in iter(functools.partial(ifile.read, self._bs), ''):
                 tfile_zip.write(b)
         # If ifile was a pipe, it would now be consumed and can be discarded
-        self._ifile = None
 
         return self._rewind_tfile()
 
     def _rewind_tfile(self):
+        # Rewinds temp file (copy mode) and returns it (cursor at pos0)
         tfile = self._temp_file
+        assert tfile, "cannot rewind temp file - not in copy mode"
         tfile.seek(0)
         tfile_zip = gzip.open(tfile, "rt") # "rb" + .decode() or "rt"
         self._ifile_gz = tfile_zip
 
         return tfile_zip
+
+    def _get_ifile(self):
+        # Input file handle
+        ifile = None
+        if self._copy_mode:
+            ifile = self._ifile_gz # wrapped fh (parent is random access)
+        else:
+            ifile = self._ifile # pre-defined input file
+        return ifile
+
+    def rewind(self):
+        """Rewinds file, cursor is set to the beginning of the input data.
+        This is possible if the constructor was provided with a regular
+        file handle that is seekable or if copy mode is enabled.
+        Note that with copy mode enabled, all input data is copied
+        to a temporary file.
+        Otherwise, with just a pipe like stdin as input file,
+        rewinding is not possible.
+        """
+
+        assert self.is_seekable(), "cannot rewind input pipe"
+        if self._copy_mode:
+            ifile = self._rewind_tfile()
+        else:
+            ifile = self._ifile
+            ifile.seek(0)
+        return ifile
 
     # The most difficult problem when streaming a large json file
     # is that we may have to keep reading, skipping over the following items
@@ -182,12 +224,18 @@ class JReader():
             e_stack["p_worker"] = p
             try:
                 done = False
-                while not done:
+                while not done: # read loop (for rewind/fast-forward)
                     # Load JSON reader
                     streamer = JSONStreamer()
                     streamer.add_catch_all_listener(catch_all_cb)
-                    # Reload/reset temporary (wrapped) file
-                    ifile = self._rewind_tfile() # ro, no random access
+                    # Reload/reset input file
+                    if self._read_i == 0:
+                        ifile = self._get_ifile()
+                        print("JREADER first iteration reading %s" % (ifile))
+                    else:
+                        ifile = self.rewind()
+                        print("JREADER next iteration reading %s" % (ifile))
+                    self._read_i += 1
                     # Dump the whole input file into the JSON reader in chunks
                     need_reset = False
                     for b in iter(functools.partial(ifile.read, self._bs), ''):
@@ -203,6 +251,7 @@ class JReader():
                 p.send(None)
 
             except Exception as e:
+                # raise e # debug
                 p.send(e) # we're piping an exception lol
                 # otherwise: p.send(None) and raise
 
